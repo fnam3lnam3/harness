@@ -1,0 +1,317 @@
+# Harness
+
+Harness is a local agent runtime. Give it a config (model, system prompt,
+HTTP-backed tools) and it runs the agent loop in-process: calls models through
+OpenRouter, dispatches tool calls, stores memory in per-agent sqlite, and
+emits traces.
+
+Harness runs in two modes:
+
+- **Standalone.** Everything in-process; config comes from `./agents/<name>.yaml`.
+  Needs `OPENROUTER_API_KEY`. Nothing talks to any cloud besides OpenRouter.
+- **Cloud (Bedrock).** Config is fetched from Bedrock; traces + sleep go
+  back to Bedrock. Triggered automatically when `BEDROCK_URL` and
+  `BEDROCK_TOKEN` are set.
+- **Workflow (current).** `harness workflow` interprets a workflow
+  definition (ordered script/agent/gate steps) fetched from the `current`
+  platform and journals every step transition and record back over HTTP
+  before advancing. Needs `CURRENT_URL`, `CURRENT_RUN_TOKEN`, and
+  `HARNESS_RUN_ID`. The sandbox is disposable; current's Postgres is the
+  source of truth, so the runner exits at approval gates and resumes from
+  the journal on re-dispatch.
+
+The mode is picked per-run based on what's in the environment; the same
+binary handles all of them.
+
+## Storage
+
+Per-agent sqlite, on the local filesystem. Harness chooses and owns the
+storage location; today that is `~/.harness/agents/<agent_id>.sqlite`.
+
+When the harness itself runs on durable infrastructure (e.g. a Daytona
+sandbox), the sqlite file persists with the host. There's no separate
+storage backend to configure.
+
+## Daytona snapshot
+
+Every commit to `main` builds and publishes a Docker image to GHCR and
+points the Daytona snapshot named `harness-latest` at the new image. See
+[`Dockerfile`](./Dockerfile) for the build; see
+[`.github/workflows/publish-daytona-snapshot.yml`](./.github/workflows/publish-daytona-snapshot.yml)
+for the publish step.
+
+Consumers create sandboxes with `snapshot="harness-latest"` and always
+get the most recent harness — the snapshot name is constant; only the
+image SHA behind it changes.
+
+### Bedrock contract
+
+Bedrock's only job inside the sandbox is to run **`harness boot`** with
+the right env vars. `boot` then handles the rest (git fetch + checkout
+to a target SHA, `uv sync`, exec into `harness agent`).
+
+```python
+from daytona import Daytona, CreateSandboxFromSnapshotParams
+
+sb = Daytona().create(CreateSandboxFromSnapshotParams(snapshot="harness-latest"))
+sb.process.exec(
+    "harness boot",
+    env={
+        "HARNESS_AGENT_ID":   agent_id,
+        "HARNESS_RUN_ID":     run_id,
+        "HARNESS_COMMIT_SHA": target_sha,   # any reachable commit on orinlabs/harness
+        "BEDROCK_URL":        bedrock_url,
+        "BEDROCK_TOKEN":      bedrock_token,
+        "OPENROUTER_API_KEY": openrouter_key,
+    },
+)
+```
+
+The harness repo is public, so no `GITHUB_TOKEN` is needed for the
+fetch. If it ever goes private, `boot` reads `GITHUB_TOKEN` from env
+and uses it for that one fetch only (never persisted to `.git/config`).
+
+`boot` and `agent` are stacked: `boot` is the bedrock-facing
+self-updating wrapper, `agent` is the actual loop. `os.execvp` between
+them is what makes "fetch new code, then run new code" actually pick up
+the new code (the running interpreter is dropped).
+
+**Required repo secrets** (Settings → Secrets → Actions):
+
+- `DAYTONA_API_KEY` — used by the publish workflow to delete + recreate
+  the snapshot.
+- `DAYTONA_API_URL` (optional) — defaults to `https://app.daytona.io/api`.
+
+**One-time Daytona setup:** add a [GHCR registry](https://www.daytona.io/docs/en/snapshots/#github-container-registry-ghcr)
+to your Daytona org so the snapshot can pull from
+`ghcr.io/orinlabs/harness:sha-...`. Or make the GHCR package public and
+skip the registry step.
+
+## Setup
+
+```bash
+uv sync --dev
+```
+
+A minimal `.env`:
+
+```bash
+OPENROUTER_API_KEY=...
+
+# Optional: enable Bedrock mode. When unset, harness runs standalone.
+BEDROCK_URL=http://127.0.0.1:8000
+BEDROCK_TOKEN=...
+```
+
+Notes:
+
+- Missing API keys fail loudly; Harness does not silently skip live calls.
+
+## Standalone Quickstart
+
+1. Drop an agent config into `./agents/<name>.yaml`.
+2. Run it:
+
+```bash
+uv run harness agent <name>
+```
+
+There's a worked example at `agents/demo.yaml`. Run:
+
+```bash
+uv run harness agent demo
+```
+
+### Config schema
+
+Flat list of tools (no adapter grouping). Bedrock serves a nested
+`adapters: [{name, tools: [...]}]` shape; the Bedrock client flattens that
+on ingest so the harness sees the same flat list regardless of source.
+
+```yaml
+id: my-agent
+model: claude-haiku-4-5
+system_prompt: |
+  You are helpful.
+reasoning_effort: medium        # optional
+
+tools:                          # flat list; no adapter grouping
+  - name: get_forecast
+    description: Five-day forecast for a city.
+    parameters:
+      type: object
+      properties:
+        city: { type: string }
+      required: [city]
+    url: http://localhost:9001/weather/get_forecast
+    timeout_seconds: 30
+    auth:                              # optional; default kind=none
+      kind: bearer_env                 # none | bearer_env | bearer_literal | headers
+      token_env: OPENWEATHER_API_KEY
+    forward_trace_context: false       # optional; default false
+```
+
+### Sleep semantics in standalone
+
+`ctx.runtime.sleep(...)` is a no-op in standalone mode. The harness still
+exits cleanly at the end of the current turn (the `SleepTool` sets
+`ctx.sleep_requested = True`), but nothing re-spawns the process at
+`until`. Use Bedrock mode when you need durable sleep/wake.
+
+### Tracing in standalone
+
+Without Bedrock env, spans go to the `StdoutTraceSink`: every trace/span
+lifecycle event is printed as one machine-readable line —
+
+```
+@@trace {"event": "open_span", "span_id": "...", "name": "turn_0", ...}
+```
+
+Same supervisor contract as the `@@sleep` sentinel: a parent process holding
+the stdout pipe can reconstruct the entire run (LLM requests/responses,
+thinking plaintext, tool args/results, timing, nesting via `parent_id`) from
+these lines alone. Without a supervisor they're inert log noise.
+
+Select a sink explicitly with `--trace-sink bedrock|stdout|null` (or
+`$HARNESS_TRACE_SINK`). `null` disables tracing entirely. The sink choice
+never affects the runtime: sleep/wake stays Bedrock-managed whenever the
+Bedrock env is set.
+
+### Usage tracking in standalone
+
+Usage totals (tokens, cost, per-model breakdown) are computed per run. They
+persist via the `TraceSink`:
+
+- With Bedrock configured, totals land on the `run_agent` trace metadata.
+- Standalone, they land on the `run_agent` / trace-close `@@trace` lines
+  (and are mirrored to the log at end-of-run).
+
+## Use With Bedrock
+
+Set `BEDROCK_URL` + `BEDROCK_TOKEN` in the environment (or pass
+`--bedrock-url`/`--bedrock-token` on the CLI; `--local` is sugar for
+`--bedrock-url http://127.0.0.1:8000`). With those present:
+
+- `harness agent <uuid>` fetches the config from Bedrock (if no local
+  `./agents/<uuid>.yaml` shadows it).
+- Traces + sleep POST back to Bedrock.
+
+```bash
+uv run harness agent <AGENT_UUID>
+uv run harness agent <AGENT_UUID> --local
+uv run harness agent <AGENT_UUID> --bedrock-url https://your-bedrock.example.com
+```
+
+Create a temporary dev agent (Bedrock auto-creates the row):
+
+```bash
+uv run harness agent --local --system-prompt "You are helpful."
+```
+
+The agent is auto-scoped to whichever organization issued `$BEDROCK_TOKEN`.
+Pass `--template <UUID_OR_NAME>` to base the new agent on an existing
+`AgentTemplate` (otherwise it's created without one).
+
+Useful flags:
+
+```bash
+uv run harness agent <AGENT_UUID> --local --model claude-haiku-4-5
+uv run harness agent <AGENT_UUID> --local --reasoning-effort medium
+uv run harness agent <AGENT_UUID> --local --run-id <RUN_UUID>
+```
+
+### Resolution order for `harness agent <X>`
+
+1. `./agents/<X>.{yaml,yml,json}` (local).
+2. Else `GET /api/cloud/agents/<X>/harness-config/` if Bedrock env is set.
+3. Else error.
+
+`harness agent` with no id auto-creates a dev agent on Bedrock (requires
+env); standalone mode errors because there's nowhere to put a generated
+config.
+
+### Reset
+
+```bash
+uv run harness reset-memory <AGENT_UUID>
+```
+
+Wipes the agent's local sqlite (and WAL/SHM sidecars). The next
+`harness agent` recreates it empty and reapplies migrations.
+
+## Evals
+
+```bash
+uv run harness eval smoke
+uv run harness eval group-lunch-memory --model claude-haiku-4-5
+```
+
+Evals run standalone by default. When Bedrock env is set, spans flow to
+Bedrock under a synthesized `eval-<scenario>-<hex>` agent_id (no agent row
+is created in Bedrock).
+
+Available scenarios:
+
+```text
+smoke
+group-lunch-fresh
+group-lunch-memory
+multi-stakeholder-scheduling
+preference-channel-fidelity
+blue-red-shoes-light
+blue-red-shoes-medium
+blue-red-shoes-heavy
+curl-wget-light
+curl-wget-heavy
+draft-before-send-heavy
+thursday-no-meetings-heavy
+vegetarian-restaurant-heavy
+vending-bench
+```
+
+## Development Loop
+
+```bash
+git checkout -b <branch-name>
+uv sync --dev
+# edit code
+uv run ruff check .
+uv run pytest
+uv run harness eval smoke
+```
+
+Targeted:
+
+```bash
+uv run pytest tests/test_harness_e2e.py
+uv run pytest tests/memory -o "addopts="
+```
+
+Testing expectations:
+
+- Default tests exclude `tests/memory`.
+- LLM-related tests use real OpenRouter calls.
+- Storage tests patch harness-owned storage internals to per-test tmp dirs;
+  nothing ever writes into `~/.harness/`.
+- If an API key is required and missing, the run fails loudly.
+
+## Repo Map
+
+```text
+src/harness/cli.py                 CLI entrypoint: harness agent / eval / reset-memory / inspect
+src/harness/harness.py             Main agent loop
+src/harness/config.py              AgentConfig, ExternalToolSpec, ToolAuth
+src/harness/config_loader.py       Load AgentConfig from ./agents/<name>.yaml
+src/harness/core/llm.py            OpenRouter client
+src/harness/core/storage.py        Per-agent local sqlite (~/.harness/agents/)
+src/harness/core/tracer.py         Trace/span context manager; delegates HTTP to TraceSink
+src/harness/core/tracing.py        TraceSink protocol + Null/Stdout/InMemory sinks
+src/harness/core/runtime.py        AgentRuntime protocol + LocalAgentRuntime
+src/harness/cloud/autoconfig.py    Pick TraceSink + AgentRuntime from env
+src/harness/cloud/bedrock/         Bedrock integration (trace sink, runtime, config fetch)
+src/harness/tools/                 Built-in and external tool wrappers
+src/harness/memory/                SQL-backed memory and summaries
+src/harness/evals/                 Eval runner, fake adapters, scenarios
+agents/                            Local agent configs (YAML)
+tests/                             Unit, e2e, and memory tests
+```

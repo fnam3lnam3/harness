@@ -1,0 +1,734 @@
+"""Hierarchical summarisation: 5m -> hourly -> daily -> weekly -> monthly.
+
+The 5m tier reads from raw `messages`; higher tiers roll up the
+next-finer tier. Each tier groups into bucket keys and writes one
+summary per completed bucket via an LLM call. Buckets still in
+progress (the current 5-minute window / hour / day / week / month)
+are skipped so we never produce partial summaries.
+
+Note: a 1-minute tier existed previously but was removed (see
+migration 0002_drop_one_minute_summaries). It was firing an LLM call
+per completed minute which dominated per-turn cost without
+meaningfully improving recall over the 5m tier.
+"""
+
+from __future__ import annotations
+
+import json
+import logging
+import uuid
+from dataclasses import dataclass, field
+from datetime import UTC, date, datetime, time, timedelta
+from typing import Any
+
+from harness.core import clock, llm, storage
+from harness.core.tracer import llm_span, text_span
+from harness.memory.bucketing import (
+    floor_to_5_minutes,
+    hour_start,
+    last_completed_5m_end,
+)
+from harness.memory.marks import force_timezone, week_start_sunday
+from harness.memory.sanitize import sanitize_messages_for_summarization
+from harness.memory.types import PERIOD_META, PeriodType
+
+logger = logging.getLogger(__name__)
+
+
+def _is_context_overflow_error(exc: llm.OpenRouterError) -> bool:
+    """Detect OpenRouter context-length 400s so the span can flag them.
+
+    OpenRouter returns the same error code (400) for many failure modes
+    -- invalid model slug, malformed schema, quota, context length, etc.
+    The body text is the only reliable signal; match a few canonical
+    phrases ("maximum context length", "context length", "context-compression
+    plugin") rather than a single brittle string.
+    """
+    if exc.status_code != 400:
+        return False
+    body = (exc.body or "").lower()
+    return any(
+        marker in body
+        for marker in (
+            "maximum context length",
+            "context length is",
+            "context-compression",
+            "exceeds the maximum",
+        )
+    )
+
+
+@dataclass
+class SummarizerUsage:
+    input_tokens: int = 0
+    output_tokens: int = 0
+    total_cost: float = 0.0
+    llm_calls: int = 0
+
+
+@dataclass
+class UpdateAllResult:
+    five_minute_created: int = 0
+    hourly_created: int = 0
+    daily_created: int = 0
+    weekly_created: int = 0
+    monthly_created: int = 0
+    llm_usage: SummarizerUsage = field(default_factory=SummarizerUsage)
+
+
+def _now_ns() -> int:
+    import time as _t
+
+    return _t.time_ns()
+
+
+def _dt_to_ns(dt: datetime) -> int:
+
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=UTC)
+    return int(dt.timestamp() * 1_000_000_000)
+
+
+class SummaryUpdater:
+    """Run sync summarisation across the five tiers in order:
+    5m -> hourly -> daily -> weekly -> monthly.
+    """
+
+    def __init__(
+        self,
+        timezone_name: str = "UTC",
+        model: str = "openai/gpt-4o-mini",
+    ):
+        self.timezone_name = timezone_name
+        self.model = model
+        self.total_usage = SummarizerUsage()
+
+    def update_all(self, current_time: datetime | None = None) -> UpdateAllResult:
+        if current_time is None:
+            current_time = clock.now().astimezone()
+        self.total_usage = SummarizerUsage()
+
+        logger.info("summarizer.update_all: starting model=%s", self.model)
+        existing_counts = self._count_existing_summaries()
+        logger.info(
+            "summarizer.update_all: sandbox already has messages=%d "
+            "five_minute=%d hourly=%d daily=%d weekly=%d monthly=%d",
+            existing_counts["messages"],
+            existing_counts["five_minute"],
+            existing_counts["hourly"],
+            existing_counts["daily"],
+            existing_counts["weekly"],
+            existing_counts["monthly"],
+        )
+        # Wrap the whole tier cascade in a single `memory_summarization`
+        # text span. Per-tier work opens child `summarize_<tier>` spans
+        # (only when there's pending work) and each LLM call opens an
+        # `llm` span underneath. Nests under whatever span is active
+        # when `update_all` is called (usually `turn_N`).
+        with text_span(
+            "memory_summarization",
+            metadata={
+                "model": self.model,
+                "existing_counts": existing_counts,
+            },
+        ) as parent_span:
+            updated_5m = self._update_five_minute_summaries(current_time)
+            updated_hour = self._update_hourly_summaries(current_time)
+            updated_day = self._update_daily_summaries(current_time)
+            updated_week = self._update_weekly_summaries(current_time)
+            updated_month = self._update_monthly_summaries(current_time)
+
+            summaries_created = {
+                "five_minute": len(updated_5m),
+                "hourly": len(updated_hour),
+                "daily": len(updated_day),
+                "weekly": len(updated_week),
+                "monthly": len(updated_month),
+            }
+            parent_span.set_metadata(
+                summaries_created=summaries_created,
+                usage={
+                    "input_tokens": self.total_usage.input_tokens,
+                    "output_tokens": self.total_usage.output_tokens,
+                    "total_cost_usd": self.total_usage.total_cost,
+                    "llm_calls": self.total_usage.llm_calls,
+                    "model": self.model,
+                },
+            )
+
+        logger.info(
+            "summarizer.update_all: done created 5m=%d hour=%d day=%d "
+            "week=%d month=%d llm_calls=%d in=%d out=%d cost=$%.5f model=%s",
+            len(updated_5m),
+            len(updated_hour),
+            len(updated_day),
+            len(updated_week),
+            len(updated_month),
+            self.total_usage.llm_calls,
+            self.total_usage.input_tokens,
+            self.total_usage.output_tokens,
+            self.total_usage.total_cost,
+            self.model,
+        )
+
+        return UpdateAllResult(
+            five_minute_created=len(updated_5m),
+            hourly_created=len(updated_hour),
+            daily_created=len(updated_day),
+            weekly_created=len(updated_week),
+            monthly_created=len(updated_month),
+            llm_usage=self.total_usage,
+        )
+
+    # ------------------------------------------------------------------
+    # 5-minute: raw messages -> one summary per completed 5-minute bucket
+    # ------------------------------------------------------------------
+    #
+    # Previously this tier rolled up 1-minute summaries. The 1m tier was
+    # removed (see migration 0002) because it was firing an LLM call per
+    # completed minute even when nothing interesting happened, which
+    # dominated per-turn cost on long-running agents. 5m is now the finest
+    # summary tier and reads the raw `messages` log directly.
+
+    def _update_five_minute_summaries(self, current_time: datetime) -> list[tuple]:
+        assert storage.db is not None
+        db = storage.db
+
+        timezone_now = force_timezone(current_time, self.timezone_name)
+        cutoff = last_completed_5m_end(timezone_now)
+
+        existing_keys = {
+            (row["date"], row["hour"], row["minute"])
+            for row in db.execute("SELECT date, hour, minute FROM five_minute_summaries")
+        }
+
+        # Lower-bound the message scan at the latest 5m summary's bucket
+        # start so we never re-scan history we've already rolled up. On
+        # a fresh DB (no 5m rows yet) this is None and we scan from the
+        # beginning of the messages table.
+        lower_ns: int | None = None
+        if existing_keys:
+            latest_key = max(existing_keys)
+            earliest_fetch = force_timezone(
+                datetime.combine(
+                    date.fromisoformat(latest_key[0]),
+                    time(latest_key[1], latest_key[2]),
+                ),
+                self.timezone_name,
+            )
+            lower_ns = _dt_to_ns(earliest_fetch)
+
+        if lower_ns is not None:
+            rows = db.execute(
+                "SELECT ts_ns, content_json FROM messages "
+                "WHERE ts_ns < ? AND ts_ns >= ? ORDER BY ts_ns",
+                (_dt_to_ns(cutoff), lower_ns),
+            ).fetchall()
+        else:
+            rows = db.execute(
+                "SELECT ts_ns, content_json FROM messages WHERE ts_ns < ? ORDER BY ts_ns",
+                (_dt_to_ns(cutoff),),
+            ).fetchall()
+
+        # Bucket raw messages into 5-minute slots. Any bucket whose
+        # boundary hasn't fully completed (end > now) is deferred to a
+        # future run so we never produce a partial summary.
+        buckets: dict[datetime, list[dict]] = {}
+        for row in rows:
+            local_time = force_timezone(
+                datetime.fromtimestamp(row["ts_ns"] / 1_000_000_000),
+                self.timezone_name,
+            )
+            bucket_start = floor_to_5_minutes(local_time)
+            bucket_end = bucket_start + timedelta(minutes=5)
+            if bucket_end > timezone_now:
+                continue
+            buckets.setdefault(bucket_start, []).append(json.loads(row["content_json"]))
+
+        pending: list[tuple[tuple[str, int, int], list[dict]]] = []
+        for bucket_start, bucket_messages in buckets.items():
+            key = (
+                bucket_start.date().isoformat(),
+                bucket_start.hour,
+                bucket_start.minute,
+            )
+            if key in existing_keys:
+                continue
+            pending.append((key, bucket_messages))
+
+        if not pending:
+            return []
+
+        logger.info(
+            "summarizer: tier=5m pending=%d -> making %d LLM call(s) via %s",
+            len(pending),
+            len(pending),
+            self.model,
+        )
+        created: list[tuple] = []
+        for (date_key, hour_key, minute_key), bucket_messages in sorted(
+            pending, key=lambda x: (x[0][0], x[0][1], x[0][2])
+        ):
+            # Strip base64 image payloads and ``reasoning_details`` signatures
+            # before serializing -- both are summarization-useless and have
+            # been observed to blow past the summarizer model's context
+            # window on vision-heavy buckets. Tool content, ``tool_calls``,
+            # ``reasoning`` plaintext, and assistant text are preserved.
+            sanitized = sanitize_messages_for_summarization(bucket_messages)
+            content = json.dumps(sanitized.messages)
+            extra_metadata: dict[str, Any] = {"content_chars": len(content)}
+            if sanitized.sanitized:
+                extra_metadata.update(
+                    sanitized=True,
+                    stripped_image_parts=sanitized.stripped_image_parts,
+                    stripped_signatures=sanitized.stripped_signatures,
+                )
+                logger.info(
+                    "summarizer: sanitized 5m bucket %s %02d:%02d "
+                    "stripped_image_parts=%d stripped_signatures=%d content_chars=%d",
+                    date_key,
+                    hour_key,
+                    minute_key,
+                    sanitized.stripped_image_parts,
+                    sanitized.stripped_signatures,
+                    len(content),
+                )
+            summary_text = self._create_summary(
+                content=content,
+                period_type=PeriodType.FIVE_MINUTE,
+                extra_metadata=extra_metadata,
+            )
+            if not summary_text or not summary_text.strip():
+                logger.error(
+                    "Failed to create 5-minute summary for %s %02d:%02d - empty, skipping",
+                    date_key,
+                    hour_key,
+                    minute_key,
+                )
+                continue
+            self._upsert_summary(
+                "five_minute_summaries",
+                ("date", "hour", "minute"),
+                (date_key, hour_key, minute_key),
+                summary_text,
+                len(bucket_messages),
+            )
+            created.append((date_key, hour_key, minute_key))
+
+        return created
+
+    # ------------------------------------------------------------------
+    # Hourly: roll up 5-minute summaries into hour buckets
+    # ------------------------------------------------------------------
+
+    def _update_hourly_summaries(self, current_time: datetime) -> list[tuple]:
+        assert storage.db is not None
+        db = storage.db
+
+        timezone_now = force_timezone(current_time, self.timezone_name)
+        cutoff = hour_start(timezone_now)
+
+        five_min_rows = db.execute(
+            "SELECT date, hour, minute, summary, message_count FROM five_minute_summaries "
+            "ORDER BY date, hour, minute"
+        ).fetchall()
+
+        hourly_groups: dict[tuple[str, int], list[dict]] = {}
+        for r in five_min_rows:
+            hourly_groups.setdefault((r["date"], r["hour"]), []).append(dict(r))
+
+        existing_keys = {
+            (row["date"], row["hour"])
+            for row in db.execute("SELECT date, hour FROM hourly_summaries")
+        }
+
+        cutoff_date = cutoff.date().isoformat()
+        pending = []
+        for (summary_date, hour), summaries_5m in hourly_groups.items():
+            if summary_date == cutoff_date and hour >= cutoff.hour:
+                continue
+            if (summary_date, hour) not in existing_keys and summaries_5m:
+                parts = [
+                    f"[{s['hour']:02d}:{s['minute']:02d}] {s['summary']}" for s in summaries_5m
+                ]
+                combined_content = "\n\n".join(parts)
+                total_messages = sum(s["message_count"] for s in summaries_5m)
+                pending.append(((summary_date, hour), combined_content, total_messages))
+
+        if not pending:
+            return []
+
+        logger.info(
+            "summarizer: tier=hourly pending=%d -> making %d LLM call(s) via %s",
+            len(pending),
+            len(pending),
+            self.model,
+        )
+        created = []
+        for (summary_date, hour), content, total_messages in sorted(
+            pending, key=lambda x: (x[0][0], x[0][1])
+        ):
+            summary_text = self._create_summary(content=content, period_type=PeriodType.HOURLY)
+            if not summary_text or not summary_text.strip():
+                continue
+            self._upsert_summary(
+                "hourly_summaries",
+                ("date", "hour"),
+                (summary_date, hour),
+                summary_text,
+                total_messages,
+            )
+            created.append((summary_date, hour))
+
+        return created
+
+    # ------------------------------------------------------------------
+    # Daily: roll up hourly summaries into days (only completed days)
+    # ------------------------------------------------------------------
+
+    def _update_daily_summaries(self, current_time: datetime) -> list[str]:
+        assert storage.db is not None
+        db = storage.db
+
+        timezone_now = force_timezone(current_time, self.timezone_name)
+        today = timezone_now.date().isoformat()
+
+        existing_keys = {row["date"] for row in db.execute("SELECT date FROM daily_summaries")}
+
+        all_hourly = db.execute(
+            "SELECT date, hour, summary, message_count FROM hourly_summaries "
+            "WHERE date < ? ORDER BY date, hour",
+            (today,),
+        ).fetchall()
+
+        hourly_by_day: dict[str, list[dict]] = {}
+        for r in all_hourly:
+            hourly_by_day.setdefault(r["date"], []).append(dict(r))
+
+        pending = []
+        for day, hour_summaries in hourly_by_day.items():
+            if day not in existing_keys:
+                parts = [f"[{h['hour']:02d}:00] {h['summary']}" for h in hour_summaries]
+                combined_content = "\n\n".join(parts)
+                total_messages = sum(h["message_count"] for h in hour_summaries)
+                pending.append((day, combined_content, total_messages))
+
+        if not pending:
+            return []
+
+        logger.info(
+            "summarizer: tier=daily pending=%d -> making %d LLM call(s) via %s",
+            len(pending),
+            len(pending),
+            self.model,
+        )
+        created = []
+        for day, content, total_messages in sorted(pending, key=lambda x: x[0]):
+            summary_text = self._create_summary(content=content, period_type=PeriodType.DAILY)
+            if not summary_text or not summary_text.strip():
+                continue
+            self._upsert_summary(
+                "daily_summaries",
+                ("date",),
+                (day,),
+                summary_text,
+                total_messages,
+            )
+            created.append(day)
+
+        return created
+
+    # ------------------------------------------------------------------
+    # Weekly: roll up daily summaries into weeks (Sunday-based)
+    # ------------------------------------------------------------------
+
+    def _update_weekly_summaries(self, current_time: datetime) -> list[str]:
+        assert storage.db is not None
+        db = storage.db
+
+        timezone_now = force_timezone(current_time, self.timezone_name)
+        today = timezone_now.date()
+        this_week_start = week_start_sunday(datetime.combine(today, time(0, 0, 0))).date()
+
+        dailies = db.execute(
+            "SELECT date, summary, message_count FROM daily_summaries WHERE date < ? ORDER BY date",
+            (this_week_start.isoformat(),),
+        ).fetchall()
+
+        weekly_groups: dict[str, list[dict]] = {}
+        for d in dailies:
+            d_date = date.fromisoformat(d["date"])
+            week = week_start_sunday(datetime.combine(d_date, time(0, 0, 0))).date().isoformat()
+            weekly_groups.setdefault(week, []).append(dict(d))
+
+        existing_keys = {
+            row["week_start_date"]
+            for row in db.execute("SELECT week_start_date FROM weekly_summaries")
+        }
+
+        pending = []
+        for week, dailies_in_week in weekly_groups.items():
+            if week not in existing_keys and dailies_in_week:
+                parts = [f"[{d['date']}] {d['summary']}" for d in dailies_in_week]
+                combined_content = "\n\n".join(parts)
+                total_messages = sum(d["message_count"] for d in dailies_in_week)
+                pending.append((week, combined_content, total_messages))
+
+        if not pending:
+            return []
+
+        logger.info(
+            "summarizer: tier=weekly pending=%d -> making %d LLM call(s) via %s",
+            len(pending),
+            len(pending),
+            self.model,
+        )
+        created = []
+        for week, content, total_messages in sorted(pending, key=lambda x: x[0]):
+            summary_text = self._create_summary(content=content, period_type=PeriodType.WEEKLY)
+            if not summary_text or not summary_text.strip():
+                continue
+            self._upsert_summary(
+                "weekly_summaries",
+                ("week_start_date",),
+                (week,),
+                summary_text,
+                total_messages,
+            )
+            created.append(week)
+
+        return created
+
+    # ------------------------------------------------------------------
+    # Monthly: roll up weekly summaries into calendar months
+    # ------------------------------------------------------------------
+
+    def _update_monthly_summaries(self, current_time: datetime) -> list[tuple]:
+        assert storage.db is not None
+        db = storage.db
+
+        timezone_now = force_timezone(current_time, self.timezone_name)
+        today = timezone_now.date()
+        this_month_start = today.replace(day=1).isoformat()
+
+        weeklies = db.execute(
+            "SELECT week_start_date, summary, message_count FROM weekly_summaries "
+            "WHERE week_start_date < ?",
+            (this_month_start,),
+        ).fetchall()
+
+        monthly_groups: dict[tuple[int, int], list[dict]] = {}
+        for w in weeklies:
+            d = date.fromisoformat(w["week_start_date"])
+            key = (d.year, d.month)
+            monthly_groups.setdefault(key, []).append(dict(w))
+
+        existing_keys = {
+            (row["year"], row["month"])
+            for row in db.execute("SELECT year, month FROM monthly_summaries")
+        }
+
+        pending = []
+        for (year, month), weeklies_in_month in monthly_groups.items():
+            if (year, month) not in existing_keys and weeklies_in_month:
+                parts = [
+                    f"[Week of {w['week_start_date']}] {w['summary']}" for w in weeklies_in_month
+                ]
+                combined_content = "\n\n".join(parts)
+                total_messages = sum(w["message_count"] for w in weeklies_in_month)
+                pending.append(((year, month), combined_content, total_messages))
+
+        if not pending:
+            return []
+
+        logger.info(
+            "summarizer: tier=monthly pending=%d -> making %d LLM call(s) via %s",
+            len(pending),
+            len(pending),
+            self.model,
+        )
+        created = []
+        for (year, month), content, total_messages in sorted(
+            pending, key=lambda x: (x[0][0], x[0][1])
+        ):
+            summary_text = self._create_summary(content=content, period_type=PeriodType.MONTHLY)
+            if not summary_text or not summary_text.strip():
+                continue
+            self._upsert_summary(
+                "monthly_summaries",
+                ("year", "month"),
+                (year, month),
+                summary_text,
+                total_messages,
+            )
+            created.append((year, month))
+
+        return created
+
+    # ------------------------------------------------------------------
+    # LLM call + upsert helpers
+    # ------------------------------------------------------------------
+
+    def _create_summary(
+        self,
+        *,
+        content: str,
+        period_type: PeriodType,
+        existing_memory: str | None = None,
+        extra_metadata: dict[str, Any] | None = None,
+    ) -> str | None:
+        """Build the summarization prompt and call OpenRouter.
+
+        ``extra_metadata`` is merged into the ``summarizer_call`` span at
+        open time. Callers use it to surface per-bucket sanitization
+        bookkeeping (``content_chars``, ``sanitized``, ...) so failed
+        runs are diagnosable from the trace alone.
+        """
+        meta = PERIOD_META[period_type]
+
+        prompt = (
+            f"You are an AI assistant creating a memory summary from {meta.time_period}. "
+            'Write in FIRST PERSON ("I worked with...", "I helped with...").\n\n'
+            f"Keep your summary to {meta.max_length} maximum.\n\n"
+        )
+
+        if existing_memory:
+            prompt += (
+                "Here is your existing memory context:\n"
+                "-- BEGIN EXISTING MEMORY --\n"
+                f"{existing_memory}\n"
+                "-- END EXISTING MEMORY --\n\n"
+            )
+
+        prompt += (
+            "For your summary focus on:\n"
+            f"{meta.focus}\n\n"
+            "CRITICAL: Only use information explicitly stated above to summarize or infer "
+            "learnings. Do NOT add details.\n\n"
+            "This is the new content that you must summarize:\n"
+            f"{content}\n\n"
+        )
+
+        span_metadata: dict[str, Any] = {
+            "model": self.model,
+            "provider": "openrouter",
+            "period_type": period_type.value,
+            "reasoning_effort": "minimal",
+            "content_chars": len(content),
+            "prompt_chars": len(prompt),
+        }
+        if extra_metadata:
+            span_metadata.update(extra_metadata)
+
+        # Wrap every summarizer LLM call in an `llm` span so the run's
+        # trace tree shows which tier fired, the input prompt, the summary
+        # output, and the per-call cost -- same treatment `_step` gives
+        # the main agent turn's `openrouter_api_call` span. Nests under
+        # `memory_summarization`, which nests under `turn_N` or
+        # `run_agent`.
+        #
+        # Pin `reasoning_effort="minimal"` so reasoning-capable models
+        # (gpt-5-nano in particular) don't burn reasoning tokens on
+        # what is essentially a straightforward rewrite task. Summary
+        # quality at this tier is more than adequate without extended
+        # thinking.
+        with llm_span("summarizer_call", metadata=span_metadata) as s:
+            s.input(prompt[:20000])
+            try:
+                resp = llm.complete(
+                    model=self.model,
+                    system="",
+                    messages=[{"role": "user", "content": prompt}],
+                    reasoning_effort="minimal",
+                )
+            except llm.OpenRouterError as e:
+                # Surface OpenRouter's JSON ``{error: {message, code}}`` body
+                # on the span so trace viewers see the actual reason a
+                # summarizer call 4xx'd (context length, invalid model,
+                # quota, etc.) -- the generic ``f"{type(e).__name__}: {e}"``
+                # capture below would otherwise truncate the most useful
+                # part. We also tag ``context_overflow`` when the upstream
+                # message clearly names the cause so dashboards / queries
+                # can filter for this specific failure mode without
+                # regexing on free-form text every time.
+                logger.exception(
+                    "Summarizer OpenRouter call failed (%s) period=%s "
+                    "content_chars=%d status=%s",
+                    e,
+                    period_type.value,
+                    len(content),
+                    e.status_code,
+                )
+                s.output(e.body)
+                error_meta: dict[str, Any] = {
+                    "error": f"{type(e).__name__}: HTTP {e.status_code}",
+                    "openrouter_status": e.status_code,
+                    "openrouter_error_body": e.body,
+                }
+                if _is_context_overflow_error(e):
+                    error_meta["context_overflow"] = True
+                s.set_metadata(**error_meta)
+                return None
+            except Exception as e:
+                logger.exception(
+                    "Summarizer LLM call failed period=%s content_chars=%d: %s",
+                    period_type.value,
+                    len(content),
+                    e,
+                )
+                s.set_metadata(error=f"{type(e).__name__}: {e}")
+                return None
+            s.output(resp.text[:20000] if resp.text else "")
+            s.set_metadata(
+                llm_cost=resp.usage.to_llm_cost_dict(),
+                finish_reason=resp.finish_reason,
+            )
+
+        self.total_usage.input_tokens += resp.usage.prompt_tokens
+        self.total_usage.output_tokens += resp.usage.completion_tokens
+        self.total_usage.total_cost += resp.usage.total_cost
+        self.total_usage.llm_calls += 1
+        return resp.text.strip()
+
+    @staticmethod
+    def _upsert_summary(
+        table: str,
+        key_columns: tuple[str, ...],
+        key_values: tuple[Any, ...],
+        summary_text: str,
+        message_count: int,
+    ) -> None:
+        """INSERT OR REPLACE a summary row by its natural key."""
+        assert storage.db is not None
+        all_columns = ("id", *key_columns, "summary", "message_count", "created_at_ns")
+        placeholders = ", ".join("?" for _ in all_columns)
+        columns_sql = ", ".join(all_columns)
+        storage.db.execute(
+            f"INSERT OR REPLACE INTO {table} ({columns_sql}) VALUES ({placeholders})",
+            (str(uuid.uuid4()), *key_values, summary_text, message_count, _now_ns()),
+        )
+
+    @staticmethod
+    def _count_existing_summaries() -> dict[str, int]:
+        """Count messages + per-tier summaries already persisted in the sandbox.
+
+        Used to log how much history we inherited from previous runs at
+        the start of `update_all`, so a run's log line makes it obvious
+        whether we're starting fresh or building on months of prior
+        rollups. Returned as a plain dict so it can also ride on the
+        `memory_summarization` span's metadata.
+        """
+        assert storage.db is not None
+        db = storage.db
+
+        def _count(table: str) -> int:
+            return db.execute(f"SELECT COUNT(*) AS c FROM {table}").fetchone()["c"]
+
+        return {
+            "messages": _count("messages"),
+            "five_minute": _count("five_minute_summaries"),
+            "hourly": _count("hourly_summaries"),
+            "daily": _count("daily_summaries"),
+            "weekly": _count("weekly_summaries"),
+            "monthly": _count("monthly_summaries"),
+        }

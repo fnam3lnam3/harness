@@ -1,0 +1,51 @@
+[project]
+name = "harness"
+version = "0.1.0"
+description = "Agent harness. Runnable agent loop with memory, tools, and OpenRouter-backed LLM calls."
+requires-python = ">=3.11"
+dependencies = [
+    "httpx>=0.27",
+    "pydantic>=2.7",
+    "pyyaml>=6.0.3",
+    # Office-file processing for workflow script/agent steps: binary tool
+    # results are delivered as files into the working directory, and xlsx
+    # is the format ingestion meets most.
+    "openpyxl>=3.1",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8",
+    "pytest-timeout>=2.3",
+    "python-dotenv>=1.0",
+    "ruff>=0.6",
+]
+
+[project.scripts]
+harness = "harness.cli:main"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/harness"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+# tests/memory/ — tiered-memory tests (expensive LLM calls). Invoke with:
+#   pytest tests/memory -o "addopts="
+addopts = "-v --tb=short --ignore=tests/memory"
+timeout = 120
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B"]
+
+[tool.ruff.lint.per-file-ignores]
+# Long narrative prompt strings — reflowing hurts readability.
+"src/harness/memory/types.py" = ["E501"]
+"src/harness/evals/scenarios/**/*.py" = ["E501"]
